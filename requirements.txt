@@ -1,0 +1,24 @@
+# IPTV Crawler Dependencies
+# Python 3.8+ required
+
+# HTTP & Networking
+aiohttp==3.9.1
+aiohttp-retry==2.8.3
+
+# HTML Parsing
+beautifulsoup4==4.12.2
+lxml==4.9.3
+
+# Language Detection & Translation
+langdetect==1.0.9
+deep-translator==1.11.4
+
+# Date/Time Utilities
+python-dateutil==2.8.2
+
+# Development & Testing (optional)
+pytest==7.4.3
+pytest-asyncio==0.21.1
+black==23.11.0
+flake8==6.1.0
+mypy==1.7.1
