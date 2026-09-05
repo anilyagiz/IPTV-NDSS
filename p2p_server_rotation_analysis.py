@@ -163,7 +163,9 @@ ROTATION_SMALI_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("pref_server_index",      re.compile(r'const-string\s+\S+,\s*"(?:server_index|host_index|current_server|active_server|server_retry|endpoint_index|mirror_index|cdn_index)"', re.I)),
     ("pref_server_url",        re.compile(r'const-string\s+\S+,\s*"(?:server_url|base_url|api_url|stream_url|server_host|active_host|current_host|backup_host)"', re.I)),
     # Config-pull: remote list fetch
-    ("fetch_config_url",       re.compile(r'const-string\s+\S+,\s*"https?://[^"]+(?:config|servers?|hosts?|endpoints?|mirrors?)[^"]*\.(?:json|xml|txt|m3u8?)"', re.I)),
+    # NOTE: quantifiers bounded to {1,300}/{0,300} to avoid catastrophic
+    # backtracking (ReDoS) on very long const-string literals.
+    ("fetch_config_url",       re.compile(r'const-string\s+\S+,\s*"https?://[^"]{1,300}(?:config|servers?|hosts?|endpoints?|mirrors?)[^"]{0,300}\.(?:json|xml|txt|m3u8?)"', re.I)),
     # Dynamic host construction (string concat of base + suffix)
     ("host_concat",            re.compile(r"invoke-virtual.*StringBuilder.*->append.*https?://")),
     # Retry loop: catch IOException then increment server pointer
@@ -187,7 +189,9 @@ ROTATION_STRING_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("round_robin",           re.compile(r"round[_\-]?robin", re.I)),
     ("load_balance",          re.compile(r"load[_\-]?balan", re.I)),
     ("server_rotation_key",   re.compile(r"server[_\-]?rotation|rotat[ei]+[_\-]?server", re.I)),
-    ("config_server_url",     re.compile(r"https?://[^\s'\"<>]{4,}(?:config|serverlist|hostlist|endpoints)[^\s'\"<>]*", re.I)),
+    # Bounded to {4,300}/{0,300} to avoid catastrophic backtracking (ReDoS)
+    # on large finditer() scans over whole-file text.
+    ("config_server_url",     re.compile(r"https?://[^\s'\"<>]{4,300}(?:config|serverlist|hostlist|endpoints)[^\s'\"<>]{0,300}", re.I)),
     ("dynamic_dns",           re.compile(r"(?:no-?ip\.com|dyn\.com|duckdns\.org|changeip\.com|freedns\.afraid\.org)", re.I)),
     ("ngrok_tunnel",          re.compile(r"\.ngrok\.(io|app)", re.I)),
     ("tor_onion",             re.compile(r"\.onion\b", re.I)),
