@@ -37,7 +37,11 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
+import zipfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -965,6 +969,91 @@ def print_terminal_summary(all_results: list[dict]):
 # CLI entry point
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Auto-decompile support for .apk and .apkm files
+# ---------------------------------------------------------------------------
+
+def _extract_base_from_apkm(apkm_path: Path, dest_dir: Path) -> Path:
+    """Extract base.apk from an APKMirror bundle (.apkm) into dest_dir.
+
+    Returns the path to the extracted base.apk.
+    """
+    base_apk = dest_dir / "base.apk"
+    with zipfile.ZipFile(apkm_path, "r") as zf:
+        if "base.apk" not in zf.namelist():
+            raise FileNotFoundError(
+                f"No base.apk inside {apkm_path.name}. "
+                f"Contents: {zf.namelist()[:10]}"
+            )
+        zf.extract("base.apk", dest_dir)
+    log.info(f"Extracted base.apk from {apkm_path.name} "
+             f"({base_apk.stat().st_size / 1e6:.1f} MB)")
+    return base_apk
+
+
+def auto_decompile(base_dir: Path) -> list[Path]:
+    """Find .apk and .apkm files under base_dir and decompile them with apktool.
+
+    For .apkm bundles, extracts base.apk first.  Skips any file whose
+    decompiled output directory already exists (contains AndroidManifest.xml).
+
+    Returns the list of decompiled output directories.
+    """
+    apk_files = sorted(
+        p for p in base_dir.iterdir()
+        if p.is_file() and p.suffix in (".apk", ".apkm")
+    )
+    if not apk_files:
+        return []
+
+    log.info(f"Found {len(apk_files)} APK/APKM file(s) to decompile.")
+    decompiled = []
+
+    for apk_path in apk_files:
+        out_name = apk_path.stem  # e.g. "emby" from emby.apk or emby.apkm
+        out_dir = base_dir / out_name
+
+        # Skip if already decompiled
+        if out_dir.is_dir() and (out_dir / "AndroidManifest.xml").exists():
+            log.info(f"  {out_name}/ already decompiled, skipping.")
+            decompiled.append(out_dir)
+            continue
+
+        # For .apkm bundles, extract base.apk to a temp dir first
+        actual_apk = apk_path
+        tmp_dir = None
+        if apk_path.suffix == ".apkm":
+            try:
+                tmp_dir = Path(tempfile.mkdtemp(prefix="apkm_"))
+                actual_apk = _extract_base_from_apkm(apk_path, tmp_dir)
+            except Exception as exc:
+                log.error(f"  Failed to extract {apk_path.name}: {exc}")
+                if tmp_dir and tmp_dir.exists():
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                continue
+
+        # Run apktool
+        log.info(f"  Decompiling {apk_path.name} -> {out_name}/")
+        try:
+            subprocess.run(
+                ["apktool", "d", str(actual_apk), "-o", str(out_dir), "-f"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            decompiled.append(out_dir)
+        except FileNotFoundError:
+            log.error("apktool not found. Install it or decompile manually.")
+            sys.exit(1)
+        except subprocess.CalledProcessError as exc:
+            log.error(f"  apktool failed for {apk_path.name}: {exc.stderr[:500]}")
+        finally:
+            if tmp_dir and tmp_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return decompiled
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Analyse decompiled APK folders for P2P/torrent delivery and server rotation."
@@ -982,7 +1071,17 @@ def main():
     parser.add_argument(
         "--app", "-a",
         default=None,
-        help="Analyse only this subdirectory name (for quick single-app runs)",
+        help="Comma-separated subdirectory name(s) to (re)analyze, e.g. "
+             "'emby,ottnavigator,perfectplayer' (for quick partial reruns). "
+             "Results are merged into --output — every other app already in "
+             "the report is left untouched.",
+    )
+    parser.add_argument(
+        "--auto-decompile",
+        action="store_true",
+        default=False,
+        help="Automatically decompile .apk and .apkm files found in --folder "
+             "using apktool (enabled automatically when no decompiled dirs exist).",
     )
     args = parser.parse_args()
 
@@ -991,35 +1090,86 @@ def main():
         log.error(f"Folder not found: {base_dir}")
         sys.exit(1)
 
-    # Discover decompiled APK dirs (they contain AndroidManifest.xml)
+    requested = None
     if args.app:
-        candidates = [base_dir / args.app]
-    else:
-        candidates = sorted([
+        requested = {a.strip() for a in args.app.split(",") if a.strip()}
+
+    def _discover():
+        return sorted([
             d for d in base_dir.iterdir()
             if d.is_dir() and (d / "AndroidManifest.xml").exists()
         ])
 
+    # Discover decompiled APK dirs (they contain AndroidManifest.xml)
+    if requested:
+        candidates = [base_dir / name for name in sorted(requested)]
+    else:
+        candidates = _discover()
+
+    # If no decompiled dirs found (or requested apps aren't decompiled yet),
+    # try auto-decompiling .apk/.apkm files.
+    need_decompile = args.auto_decompile or (not requested and not candidates) or (
+        requested and any(
+            not (base_dir / name / "AndroidManifest.xml").exists() for name in requested
+        )
+    )
+    if need_decompile:
+        newly_decompiled = auto_decompile(base_dir)
+        if requested:
+            candidates = [base_dir / name for name in sorted(requested)]
+        elif newly_decompiled:
+            candidates = _discover()
+
+    candidates = [c for c in candidates if (c / "AndroidManifest.xml").exists()]
     if not candidates:
         log.error(f"No decompiled APK directories found under {base_dir}. "
-                  "Run apktool first (see README).")
+                  "Place .apk or .apkm files there and re-run with --auto-decompile, "
+                  "or run apktool manually (see README).")
         sys.exit(1)
 
     log.info(f"Found {len(candidates)} decompiled APK directories.")
 
-    all_results = []
+    new_results = []
     for apk_dir in candidates:
         try:
             result = analyze_apk_dir(apk_dir)
-            all_results.append(result)
+            new_results.append(result)
         except Exception as exc:
             log.error(f"Failed to analyse {apk_dir.name}: {exc}", exc_info=True)
+
+    json_path = args.output + ".json"
+
+    # Merge with any pre-existing report so a partial/single-app rerun (--app)
+    # doesn't clobber results for apps that weren't touched this run. Also
+    # prunes entries for apps whose decompiled dir no longer exists (e.g. an
+    # app was replaced) so stale results don't linger in the merged report.
+    all_results = list(new_results)
+    if requested and os.path.exists(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as fh:
+                existing = json.load(fh)
+        except Exception as exc:
+            log.warning(f"Could not load existing report {json_path} to merge ({exc}); overwriting.")
+            existing = []
+        new_apps = {r["app"] for r in new_results}
+        current_dirs = {d.name for d in base_dir.iterdir() if d.is_dir()}
+        dropped = [
+            r for r in existing
+            if r.get("app") not in new_apps and r.get("app") not in current_dirs
+        ]
+        if dropped:
+            log.info(f"Pruning {len(dropped)} stale entry(ies) with no decompiled dir: "
+                      f"{', '.join(r.get('app', '?') for r in dropped)}")
+        kept = [
+            r for r in existing
+            if r.get("app") not in new_apps and r.get("app") in current_dirs
+        ]
+        all_results = kept + new_results
 
     # Print terminal summary
     print_terminal_summary(all_results)
 
     # JSON report
-    json_path = args.output + ".json"
     generate_json_report(all_results, json_path)
 
     # Excel report
