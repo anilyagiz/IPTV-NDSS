@@ -25,6 +25,9 @@ import json
 import sys
 import logging
 import argparse
+import shutil
+import tempfile
+import zipfile
 from collections import defaultdict
 
 import pandas as pd
@@ -56,6 +59,45 @@ def _xlsx_safe(value):
         return value
     s = str(value)
     return _ILLEGAL_XLSX_CHARS.sub("", s)
+
+# ---------------------------------------------------------------------------
+# APKM / split-APK bundle support
+# ---------------------------------------------------------------------------
+# APKMirror bundles (.apkm) are ZIP archives containing base.apk plus
+# split_config.*.apk fragments for density, language, and ABI.
+# All code, manifest, and core resources live in base.apk.
+
+_apkm_tmp_dirs = []  # cleaned up at exit
+
+
+def extract_base_from_apkm(apkm_path):
+    """Extract base.apk from an .apkm bundle and return its path.
+
+    Creates a temporary directory that persists until process exit.
+    """
+    tmp_dir = tempfile.mkdtemp(prefix="apkm_")
+    _apkm_tmp_dirs.append(tmp_dir)
+    base_apk = os.path.join(tmp_dir, "base.apk")
+    with zipfile.ZipFile(apkm_path, "r") as zf:
+        if "base.apk" not in zf.namelist():
+            raise FileNotFoundError(
+                f"No base.apk found inside {os.path.basename(apkm_path)}. "
+                f"Contents: {zf.namelist()[:10]}"
+            )
+        zf.extract("base.apk", tmp_dir)
+    print(f"    [apkm] Extracted base.apk from {os.path.basename(apkm_path)} "
+          f"({os.path.getsize(base_apk) / 1e6:.1f} MB)")
+    return base_apk
+
+
+import atexit
+
+def _cleanup_apkm_temps():
+    for d in _apkm_tmp_dirs:
+        shutil.rmtree(d, ignore_errors=True)
+
+atexit.register(_cleanup_apkm_temps)
+
 
 ANDROID_NS = "http://schemas.android.com/apk/res/android"
 DEFAULT_FOLDER = "apks"
@@ -2259,6 +2301,14 @@ def main():
         default=0,
         help="Process at most N new APKs in this run (0 = unlimited).",
     )
+    parser.add_argument(
+        "--apps",
+        default=None,
+        help="Comma-separated list of APK basenames (with or without extension, "
+             "e.g. 'emby,ottnavigator,perfectplayer') to (re)analyze. Forces "
+             "reprocessing of just those apps even if already present in "
+             "--output, leaving every other app in the report untouched.",
+    )
     args = parser.parse_args()
 
     folder = args.folder
@@ -2270,10 +2320,12 @@ def main():
         return
 
     apk_files = sorted(
-        os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".apk")
+        os.path.join(folder, f)
+        for f in os.listdir(folder)
+        if f.endswith(".apk") or f.endswith(".apkm")
     )
     if not apk_files:
-        print(f"No APK files found in '{folder}'.")
+        print(f"No APK or APKM files found in '{folder}'.")
         return
 
     print(f"[+] Found {len(apk_files)} APK(s) to analyze")
@@ -2294,6 +2346,35 @@ def main():
             all_results = []
             processed = set()
 
+    # Prune entries for APKs that no longer exist in --folder (e.g. an app
+    # was removed/replaced) so stale results don't linger in the report.
+    current_basenames = {os.path.basename(p) for p in apk_files}
+    stale = [r for r in all_results if r.get("apk_file") and r["apk_file"] not in current_basenames]
+    if stale:
+        print(f"[+] Pruning {len(stale)} stale entry(ies) no longer in '{folder}': "
+              f"{', '.join(r['apk_file'] for r in stale)}")
+        all_results = [r for r in all_results if r not in stale]
+        processed = {r.get("apk_file") for r in all_results if r.get("apk_file")}
+
+    # --apps: restrict this run to specific APKs and force their reprocessing
+    # even if already present in the report (other apps are left untouched).
+    if args.apps:
+        requested = {a.strip() for a in args.apps.split(",") if a.strip()}
+
+        def _matches_requested(basename):
+            stem = os.path.splitext(basename)[0]
+            return basename in requested or stem in requested
+
+        apk_files = [p for p in apk_files if _matches_requested(os.path.basename(p))]
+        if not apk_files:
+            print(f"[!] --apps '{args.apps}' matched no files in '{folder}'.")
+            return
+        target_basenames = {os.path.basename(p) for p in apk_files}
+        all_results = [r for r in all_results if r.get("apk_file") not in target_basenames]
+        processed = {r.get("apk_file") for r in all_results if r.get("apk_file")}
+        print(f"[+] --apps: forcing reprocessing of {len(apk_files)} app(s): "
+              f"{', '.join(target_basenames)}")
+
     ok = sum(1 for r in all_results if "analysis_error" not in r)
     new_in_this_run = 0
     for i, path in enumerate(apk_files, 1):
@@ -2305,7 +2386,20 @@ def main():
             print(f"\n[+] Reached --limit {args.limit}; stopping for this run.")
             break
         print(f"\n[{i}/{len(apk_files)}] {basename}")
-        result = analyze_apk(path)
+        # For .apkm bundles, extract base.apk and analyse that instead.
+        if basename.endswith(".apkm"):
+            try:
+                actual_apk = extract_base_from_apkm(path)
+            except Exception as e:
+                print(f"[!] Failed to extract base.apk from {basename}: {e}")
+                all_results.append({"apk_file": basename, "analysis_error": str(e)})
+                new_in_this_run += 1
+                continue
+            result = analyze_apk(actual_apk)
+            # Label with the original .apkm filename so reports stay consistent
+            result["apk_file"] = basename
+        else:
+            result = analyze_apk(path)
         all_results.append(result)
         new_in_this_run += 1
         if "analysis_error" not in result:
@@ -2327,7 +2421,7 @@ def main():
 
     # ---- Final summary ----
     print("\n" + "=" * 70)
-    print(f"[+] Successfully analyzed: {ok}/{len(apk_files)} APKs")
+    print(f"[+] Successfully analyzed: {ok}/{len(all_results)} APKs in report")
     apps = [r for r in all_results if "analysis_error" not in r]
     if apps:
         scores = [r.get("risk_score", 0) for r in apps]
